@@ -1,6 +1,6 @@
 import os.path as osp
 import os, re, traceback, sys
-from typing import List, Union
+from typing import List, Optional, Union
 from pathlib import Path
 import subprocess
 from functools import partial
@@ -32,9 +32,14 @@ from ballontranslator.utils.proj_imgtrans import ProjImgTrans
 from .canvas import Canvas
 from .configpanel import ConfigPanel
 from .module_manager import ModuleManager
-from .textedit_area import SourceTextEdit, TransTextEdit
+from .text_engine.editing.widgets import SourceTextEdit, TransTextEdit
 from .drawingpanel import DrawingPanel
-from .scenetext_manager import SceneTextManager, TextPanel, PasteSrcItemsCommand
+from .text_engine.editing.manager import (
+    PasteSrcItemsCommand,
+    SceneTextManager,
+    SceneTextReplacementReason,
+    TextPanel,
+)
 from .mainwindowbars import TitleBar, LeftBar, BottomBar
 from .menu_style import install_app_style_filters
 from .io_thread import ImgSaveThread, ImportDocThread, ExportDocThread
@@ -43,11 +48,12 @@ from .update_dialog import UpdateReleaseDialog
 from .run_pipeline_dialog import RunPipelineDialog
 from .custom_widget import Widget, ViewWidget
 from .global_search_widget import GlobalSearchWidget
-from .textedit_commands import GlobalRepalceAllCommand
+from .text_engine.editing.commands import GlobalRepalceAllCommand
+from .text_engine.transforms.grid import start_grid_numba_warmup
 from .framelesswindow import FramelessWindow, FramelessMoveResize
 from .drawing_commands import RunBlkTransCommand
 from .keywordsubwidget import KeywordSubWidget
-from .module_param_i18n import ModuleParamTranslator, register_module_param_translator
+from .module_parse_widgets import ModuleParamDialog
 from . import shared_widget as SW
 from .custom_widget import MessageBox, FrameLessMessageBox, ImgtransProgressMessageBox, ProgressMessageBox
 
@@ -70,6 +76,8 @@ class PageListView(QListWidget):
         return super().contextMenuEvent(e)
 
 mainwindow_cls = Widget if shared.HEADLESS else FramelessWindow
+
+
 class MainWindow(mainwindow_cls):
 
     imgtrans_proj: ProjImgTrans = ProjImgTrans()
@@ -103,12 +111,10 @@ class MainWindow(mainwindow_cls):
         self.show_llm_model_dialog.connect(self.on_show_llm_model_dialog)
         shared.show_llm_base_url_dialog_in_mainthread = self.show_llm_base_url_dialog.emit
         self.show_llm_base_url_dialog.connect(self.on_show_llm_base_url_dialog)
-        if not shared.HEADLESS:
-            self.module_param_translator = ModuleParamTranslator(parent=self)
-            register_module_param_translator(self.module_param_translator)
         shared.register_view_widget = self.register_view_widget
 
         self.backup_blkstyles = []
+        self.module_param_dialog: Optional[ModuleParamDialog] = None
         self._run_imgtrans_wo_textstyle_update = False
         self._render_only = False
         self._render_global_format = None
@@ -149,6 +155,8 @@ class MainWindow(mainwindow_cls):
                     show_release_info=show_release_info,
                 ),
             )
+        # The callback cannot run until construction returns to the event loop.
+        QTimer.singleShot(0, start_grid_numba_warmup)
 
     def setupThread(self):
         self.imsave_thread = ImgSaveThread()
@@ -173,13 +181,13 @@ class MainWindow(mainwindow_cls):
         screen_size = QGuiApplication.primaryScreen().geometry().size()
         self.setMinimumWidth(screen_size.width() // 2)
         self.configPanel = ConfigPanel(self)
-        self.configPanel.trans_config_panel.show_pre_MT_keyword_window.connect(
+        self.configPanel.show_pre_MT_keyword_window.connect(
             self.show_pre_MT_keyword_window
         )
-        self.configPanel.trans_config_panel.show_MT_keyword_window.connect(
+        self.configPanel.show_MT_keyword_window.connect(
             self.show_MT_keyword_window
         )
-        self.configPanel.trans_config_panel.show_OCR_keyword_window.connect(
+        self.configPanel.show_OCR_keyword_window.connect(
             self.show_OCR_keyword_window
         )
 
@@ -247,7 +255,7 @@ class MainWindow(mainwindow_cls):
         self.bottomBar.originalSlider.valueChanged.connect(self.canvas.setOriginalTransparencyBySlider)
         self.bottomBar.textlayerSlider.valueChanged.connect(self.canvas.setTextLayerTransparencyBySlider)
         
-        self.drawingPanel = DrawingPanel(self.canvas, self.configPanel.inpaint_config_panel)
+        self.drawingPanel = DrawingPanel(self.canvas)
         self.textPanel = TextPanel(self.app)
         self.textPanel.formatpanel.foldTextBtn.checkStateChanged.connect(self.fold_textarea)
         self.textPanel.formatpanel.sourceBtn.checkStateChanged.connect(self.show_source_text)
@@ -345,29 +353,19 @@ class MainWindow(mainwindow_cls):
             metadata['lang_source'],
             metadata['lang_target'],
         )
-        self.configPanel.trans_config_panel.setTranslatorMetadata(
-            metadata['name'],
-            metadata['supported_src_list'],
-            metadata['supported_tgt_list'],
-            metadata['lang_source'],
-            metadata['lang_target'],
-        )
-
     def on_module_selection_changed(self, module_key: str, module_name: str):
         profile_id = ''
         if module_key == 'translator':
             self.setTranslatorSelectionFromMetadata(module_name)
             profile_id = pcfg.module.translator_llm_id
         elif module_key == 'textdetector':
-            self.configPanel.detect_config_panel.setDetector(module_name)
             self.bottomBar.textdet_selector.setSelectedValue(module_name)
         elif module_key == 'ocr':
-            self.configPanel.ocr_config_panel.setOCR(module_name)
             self.bottomBar.ocr_selector.setSelectedValue(module_name)
             profile_id = pcfg.module.ocr_llm_id
         elif module_key == 'inpainter':
-            self.configPanel.inpaint_config_panel.setInpainter(module_name)
             self.bottomBar.inpaint_selector.setSelectedValue(module_name)
+            self.drawingPanel.setInpainter(module_name)
             profile_id = pcfg.module.inpaint_llm_id
         if profile_id:
             self.configPanel.llm_profiles_panel.refreshSelectionBorders(profile_id)
@@ -394,6 +392,10 @@ class MainWindow(mainwindow_cls):
         self.bottomBar.textdet_selector.setSelectedValue(pcfg.module.textdetector)
         self.bottomBar.ocr_selector.setSelectedValue(pcfg.module.ocr)
         self.bottomBar.inpaint_selector.setSelectedValue(pcfg.module.inpainter)
+        self.drawingPanel.setInpainterOptions(
+            GET_VALID_INPAINTERS(),
+            pcfg.module.inpainter,
+        )
 
         self.module_manager = module_manager = ModuleManager(self.imgtrans_proj)
         module_manager.imgtrans_pipeline_finished.connect(self.on_imgtrans_pipeline_finished)
@@ -428,11 +430,11 @@ class MainWindow(mainwindow_cls):
         self.bottomBar.ocr_selector.edit_clicked.connect(self.focus_llm_profile)
         self.bottomBar.ocr_selector.selector.currentTextChanged.connect(self.on_ocr_changed)
         self.bottomBar.ocr_selector.llm_profile_changed.connect(self.on_ocr_llm_profile_changed)
+        self.drawingPanel.inpainter_changed.connect(module_manager.selectInpainter)
+        self.drawingPanel.inpainter_config_requested.connect(self.to_inpaint_config)
         for idx, action in enumerate(self.titleBar.moduleVisibilityActions):
             self._set_module_tool_visibility(idx, action.isChecked())
 
-        self.configPanel.trans_config_panel.llm_profile_changed.connect(self.on_llm_profile_changed)
-        self.configPanel.trans_config_panel.llm_profile_config_clicked.connect(self.focus_llm_profile)
         self.configPanel.llm_profiles_panel.profile_ui_updated.connect(self.on_llm_profile_ui_updated)
         self.configPanel.llm_profiles_panel.profile_summary_changed.connect(self.on_llm_profile_summary_changed)
         self.configPanel.llm_profiles_panel.set_translator_requested.connect(
@@ -478,9 +480,9 @@ class MainWindow(mainwindow_cls):
         self.configPanel.save_config.connect(self.save_config)
         self.configPanel.check_update.connect(self.check_for_updates)
         self.configPanel.reload_textstyle.connect(self.load_textstyle_from_proj_dir)
-        self.configPanel.show_only_custom_font.connect(self.on_show_only_custom_font)
-        if pcfg.let_show_only_custom_fonts_flag:
-            self.on_show_only_custom_font(True)
+        self.configPanel.font_list_changed.connect(self.on_show_only_custom_font)
+        if pcfg.let_show_only_custom_fonts_flag or pcfg.excluded_fonts:
+            self.on_show_only_custom_font(pcfg.let_show_only_custom_fonts_flag)
 
         textblock_mode = pcfg.imgtrans_textblock
         if pcfg.imgtrans_textedit:
@@ -656,11 +658,12 @@ class MainWindow(mainwindow_cls):
             pcfg.text_styles_path = text_style_path
             save_text_styles()
 
-    def on_show_only_custom_font(self, only_custom: bool):
+    def on_show_only_custom_font(self, only_custom: bool) -> None:
         if only_custom:
             font_list = shared.CUSTOM_FONTS
         else:
             font_list = shared.FONT_FAMILIES
+        font_list = shared.get_filtered_font_list(font_list, pcfg.excluded_fonts)
         self.textPanel.formatpanel.familybox.update_font_list(font_list)
 
     def openDir(self, directory: str):
@@ -670,7 +673,10 @@ class MainWindow(mainwindow_cls):
             self.generate_tif_thumbnails(directory)
             # 重新加载项目，此时应该只加载预览图
             self.imgtrans_proj.load(directory)
-            self.st_manager.clearSceneTextitems()
+            self.st_manager.clearSceneTextitems(
+                SceneTextReplacementReason.PROJECT_RELOAD
+            )
+            self.canvas.clear_undostack(update_saved_step=True)
             self.titleBar.setTitleContent(osp.basename(directory))
             self.updatePageList()
             self.opening_dir = False
@@ -711,7 +717,10 @@ class MainWindow(mainwindow_cls):
         try:
             self.opening_dir = True
             self.imgtrans_proj.load_from_json(json_path)
-            self.st_manager.clearSceneTextitems()
+            self.st_manager.clearSceneTextitems(
+                SceneTextReplacementReason.PROJECT_RELOAD
+            )
+            self.canvas.clear_undostack(update_saved_step=True)
             self.leftBar.updateRecentProjList(self.imgtrans_proj.proj_path)
             self.updatePageList()
             self.titleBar.setTitleContent(osp.basename(self.imgtrans_proj.proj_path))
@@ -748,6 +757,9 @@ class MainWindow(mainwindow_cls):
         save_config()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        # Pending numeric edits are not dirty until they commit. Resolve them
+        # before the close-time dirty check and final config snapshot.
+        self.st_manager.formatpanel.resolve_text_transform_edits_for_save()
         if not self.imgtrans_proj.is_empty:
             self.conditional_save(keep_exist_as_backup=True)
         while True:
@@ -799,12 +811,19 @@ class MainWindow(mainwindow_cls):
         item = self.pageList.currentItem()
         self.page_changing = True
         if item is not None:
+            if not self.opening_dir:
+                # Typed transform edits belong to the old page and must commit
+                # before its dirty check. Live drags are previews and cancel.
+                self.st_manager.formatpanel.resolve_text_transform_edits_for_page_change()
             if self.save_on_page_changed:
                 self.conditional_save()
+            self.st_manager.clearSceneTextitems(
+                SceneTextReplacementReason.PAGE_CHANGE
+            )
             self.imgtrans_proj.set_current_img(item.text())
             self.canvas.clear_undostack(update_saved_step=True)
             self.canvas.updateCanvas()
-            self.st_manager.updateSceneTextitems()
+            self.st_manager.populateSceneTextitems()
             self.titleBar.setTitleContent(page_name=self.imgtrans_proj.current_img)
             self.module_manager.handle_page_changed()
             self.drawingPanel.handle_page_changed()
@@ -828,6 +847,9 @@ class MainWindow(mainwindow_cls):
         self.titleBar.exporttstyle_trigger.connect(self.export_tstyles)
         self.titleBar.darkmode_trigger.connect(self.on_darkmode_triggered)
         self.titleBar.merge_tool_trigger.connect(self.on_open_merge_tool)
+        self.titleBar.font_exclusion_trigger.connect(
+            self.configPanel.show_font_exclusion_dialog
+        )
 
         shortcutA = QShortcut(QKeySequence("A"), self)
         shortcutA.activated.connect(self.shortcutBefore)
@@ -868,7 +890,12 @@ class MainWindow(mainwindow_cls):
         drawpanel_shortcuts = {'hand': 'H', 'rect': 'R', 'inpaint': 'J', 'pen': 'B'}
         for tool_name, shortcut_key in drawpanel_shortcuts.items():
             shortcut = QShortcut(QKeySequence(shortcut_key), self)
-            shortcut.activated.connect(partial(self.drawingPanel.shortcutSetCurrentToolByName, tool_name))
+            key = getattr(QKEY, f'Key_{shortcut_key}')
+            shortcut.activated.connect(partial(
+                self.drawingPanel.shortcutSetCurrentToolByName,
+                tool_name,
+                key,
+            ))
             self.drawingPanel.setShortcutTip(tool_name, shortcut_key)
 
     def shortcutNext(self):
@@ -960,9 +987,11 @@ class MainWindow(mainwindow_cls):
             self.textPanel.formatpanel.formatBtnGroup.underlineBtn.click()
 
     def on_redo(self):
+        self.st_manager.formatpanel.resolve_text_transform_edits_for_history_change()
         self.canvas.redo()
 
     def on_undo(self):
+        self.st_manager.formatpanel.resolve_text_transform_edits_for_history_change()
         self.canvas.undo()
 
     def on_page_search(self):
@@ -1191,6 +1220,17 @@ class MainWindow(mainwindow_cls):
             self.save_on_page_changed = ori_save 
             return
 
+        # This path disables the normal page-change save callback. Commit the
+        # old page's pending transform before its own dirty check, while
+        # suppressing the search-result invalidation normally caused by a new
+        # text undo command during an in-progress replace/rerender operation.
+        page_changing = self.page_changing
+        self.page_changing = True
+        try:
+            self.st_manager.formatpanel.resolve_text_transform_edits_for_save()
+        finally:
+            self.page_changing = page_changing
+
         if current_img not in self.global_search_widget.page_set:
             if self.canvas.projstate_unsaved: 
                 self.saveCurrentPage()
@@ -1214,6 +1254,8 @@ class MainWindow(mainwindow_cls):
         edit.setTextCursor(cursor)
 
     def shortcutEscape(self):
+        if self.canvas.handle_transform_modal_shortcut(QKEY.Key_Escape):
+            return
         if self.canvas.search_widget.isVisible():
             self.canvas.search_widget.hide()
         elif self.canvas.editing_textblkitem is not None and self.canvas.editing_textblkitem.isEditing():
@@ -1263,7 +1305,13 @@ class MainWindow(mainwindow_cls):
         
         if not self.imgtrans_proj.img_valid:
             return
-        
+
+        if update_scene_text or save_proj:
+            # Resolve text-transform editor state before both the canonical
+            # project snapshot and the result-image render consume it. The
+            # render-only translation completion path saves its project first.
+            self.st_manager.formatpanel.resolve_text_transform_edits_for_save()
+
         if restore_interface:
             set_canvas_focus = self.canvas.hasFocus()
             sel_textitem = self.canvas.selected_text_items()
@@ -1340,7 +1388,7 @@ class MainWindow(mainwindow_cls):
                 editing_textitem.startEdit()
         
     def to_trans_config(self):
-        self.configPanel.focusOnTranslator()
+        self.show_module_param_dialog('translator', pcfg.module.translator)
 
     def focus_llm_profile(self, profile_id: str = None, expand_details: bool = True, target: str = 'api_key'):
         self.configPanel.focusOnLLMProfile(
@@ -1350,32 +1398,103 @@ class MainWindow(mainwindow_cls):
         )
 
     def to_inpaint_config(self):
-        self.configPanel.focusOnInpaint()
+        self.show_module_param_dialog('inpainter', pcfg.module.inpainter)
 
     def to_ocr_config(self):
-        self.configPanel.focusOnOCR()
+        self.show_module_param_dialog('ocr', pcfg.module.ocr)
 
     def to_detect_config(self):
-        self.configPanel.focusOnDetect()
+        self.show_module_param_dialog('textdetector', pcfg.module.textdetector)
+
+    def show_module_param_dialog(
+        self,
+        module_type: str,
+        module_name: str,
+    ) -> None:
+        current = self.module_param_dialog
+        if current is not None and current.isVisible():
+            if (
+                current.module_type == module_type
+                and current.module_key == module_name
+            ):
+                current.raise_()
+                current.activateWindow()
+                return
+            current.close()
+
+        parent = self.sender()
+        if not isinstance(parent, RunPipelineDialog):
+            parent = self
+        dialog = ModuleParamDialog(
+            module_type,
+            module_name,
+            self.module_manager.moduleParams(module_type, module_name),
+            self.module_manager.moduleRuntimeActionsEnabled(
+                module_type,
+                module_name,
+            ),
+            parent,
+        )
+        dialog.paramwidget_edited.connect(
+            self.module_manager.onModuleParamEdited
+        )
+        dialog.finished.connect(self._clear_module_param_dialog)
+        dialog.destroyed.connect(
+            self._clear_destroyed_module_param_dialog
+        )
+        if isinstance(parent, RunPipelineDialog):
+            parent.finished.connect(dialog.close)
+        self.module_param_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _clear_module_param_dialog(self, _result=None) -> None:
+        if self.sender() is self.module_param_dialog:
+            self.module_param_dialog = None
+
+    def _clear_destroyed_module_param_dialog(self, _dialog=None) -> None:
+        current = self.module_param_dialog
+        if current is None:
+            return
+        try:
+            current.objectName()
+        except RuntimeError:
+            self.module_param_dialog = None
+
+    def on_run_module_selected(
+        self,
+        module_type: str,
+        module_name: str,
+    ) -> None:
+        setter = {
+            'textdetector': self.module_manager.selectTextDetector,
+            'ocr': self.module_manager.selectOCR,
+            'translator': self.module_manager.selectTranslator,
+            'inpainter': self.module_manager.selectInpainter,
+        }[module_type]
+        setter(module_name)
+        dialog = self.sender()
+        if module_type == 'translator' and isinstance(
+            dialog,
+            RunPipelineDialog,
+        ):
+            dialog.setTranslatorMetadata(
+                self.module_manager.translator_metadata(module_name)
+            )
 
     def on_textdet_changed(self):
         module = self.bottomBar.textdet_selector.selector.currentText()
-        tgt_selector = self.configPanel.detect_config_panel.module_combobox
-        if tgt_selector.currentText() != module and module in GET_VALID_TEXTDETECTORS():
-            tgt_selector.setCurrentText(module)
+        self.module_manager.selectTextDetector(module)
 
     def on_ocr_changed(self):
         module = self.bottomBar.ocr_selector.selector.currentText()
-        tgt_selector = self.configPanel.ocr_config_panel.module_combobox
-        if tgt_selector.currentText() != module and module in GET_VALID_OCR():
-            tgt_selector.setCurrentText(module)
+        self.module_manager.selectOCR(module)
         self.bottomBar.ocr_selector.updateButtonText()
 
     def on_trans_changed(self):
         module = self.bottomBar.trans_selector.selector.currentText()
-        tgt_selector = self.configPanel.trans_config_panel.module_combobox
-        if tgt_selector.currentText() != module and module in GET_VALID_TRANSLATORS():
-            tgt_selector.setCurrentText(module)
+        self.module_manager.selectTranslator(module)
         self.bottomBar.trans_selector.updateButtonText()
 
     def on_llm_profile_changed(self, profile_id: str):
@@ -1383,7 +1502,6 @@ class MainWindow(mainwindow_cls):
             pcfg.module.translator_llm_id = profile_id
             self.configPanel.llm_profiles_panel.syncProfile(profile_id)
             self.configPanel.llm_profiles_panel.setSelectedProfile('translator', profile_id)
-        self.configPanel.trans_config_panel.refreshLLMProfiles()
         self.bottomBar.trans_selector.updateButtonText()
 
     def on_ocr_llm_profile_changed(self, profile_id: str):
@@ -1401,7 +1519,6 @@ class MainWindow(mainwindow_cls):
         self.bottomBar.inpaint_selector.updateButtonText()
 
     def on_llm_profile_ui_updated(self):
-        self.configPanel.trans_config_panel.refreshLLMProfiles()
         self.bottomBar.trans_selector.updateButtonText()
         self.bottomBar.ocr_selector.updateButtonText()
         self.bottomBar.inpaint_selector.updateButtonText()
@@ -1441,23 +1558,8 @@ class MainWindow(mainwindow_cls):
 
     def on_inpaint_changed(self):
         module = self.bottomBar.inpaint_selector.selector.currentText()
-        tgt_selector = self.configPanel.inpaint_config_panel.module_combobox
-        if tgt_selector.currentText() != module and module in GET_VALID_INPAINTERS():
-            tgt_selector.setCurrentText(module)
+        self.module_manager.selectInpainter(module)
         self.bottomBar.inpaint_selector.updateButtonText()
-
-    def on_transpagebtn_pressed(self, run_target: bool):
-        page_key = self.imgtrans_proj.current_img
-        if page_key is None:
-            return
-
-        blkitem_list = self.st_manager.textblk_item_list
-
-        if len(blkitem_list) < 1:
-            return
-        
-        self.translateBlkitemList(blkitem_list, -1)
-
 
     def translateBlkitemList(self, blkitem_list: List, mode: int) -> bool:
 
@@ -1586,6 +1688,9 @@ class MainWindow(mainwindow_cls):
                     if sw > 0 and enable_ocr and enable_detect and not override_fnt_size:
                         blk.font_size = blk.font_size / (1 + sw)
 
+                    # Apply the complete global text-transform stack.
+                    blk.fontformat.text_transform = gf.text_transform
+
             self.st_manager.auto_textlayout_flag = pcfg.let_autolayout_flag and \
                 (enable_detect or enable_translate)
         
@@ -1668,21 +1773,29 @@ class MainWindow(mainwindow_cls):
         )
         dialog.translate_source_changed.connect(self.on_trans_src_changed)
         dialog.translate_target_changed.connect(self.on_trans_tgt_changed)
-        result = dialog.exec_()
-        if result == RunPipelineDialog.CONTINUE:
+        dialog.module_selected.connect(self.on_run_module_selected)
+        dialog.module_config_requested.connect(self.show_module_param_dialog)
+        self.module_manager.module_selection_changed.connect(
+            dialog.setModuleSelection
+        )
+        try:
+            result = dialog.exec_()
+            if result == RunPipelineDialog.CONTINUE:
+                self._run_imgtrans_wo_textstyle_update = False
+                self.on_run_imgtrans(continue_mode=True)
+                return
+            if result == RunPipelineDialog.RENDER:
+                self._run_imgtrans_wo_textstyle_update = (
+                    dialog.render_without_text_style_update.isChecked()
+                )
+                self.on_run_imgtrans(render_only=True)
+                return
+            if result != RunPipelineDialog.RUN:
+                return
             self._run_imgtrans_wo_textstyle_update = False
-            self.on_run_imgtrans(continue_mode=True)
-            return
-        if result == RunPipelineDialog.RENDER:
-            self._run_imgtrans_wo_textstyle_update = (
-                dialog.render_without_text_style_update.isChecked()
-            )
-            self.on_run_imgtrans(render_only=True)
-            return
-        if result != RunPipelineDialog.RUN:
-            return
-        self._run_imgtrans_wo_textstyle_update = False
-        self.on_run_imgtrans(pages_to_process=dialog.selected_pages())
+            self.on_run_imgtrans(pages_to_process=dialog.selected_pages())
+        finally:
+            dialog.deleteLater()
 
     def on_run_imgtrans(
         self,

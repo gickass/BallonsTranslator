@@ -306,12 +306,37 @@ class ProgramConfig(Config):
     expand_teffect_panel: bool = True
     text_advanced_format_panel: bool = True
     expand_tadvanced_panel: bool = True
+    text_transform_panel: bool = True
+    expand_ttransform_panel: bool = True
+    excluded_fonts: List[str] = field(default_factory=list)
 
     @staticmethod
     def load(cfg_path: str):
         
         with open(cfg_path, 'r', encoding='utf8') as f:
             config_dict = json.loads(f.read())
+
+        if 'excluded_fonts' in config_dict:
+            excluded_fonts = config_dict['excluded_fonts']
+            if not isinstance(excluded_fonts, list):
+                LOGGER.warning(
+                    'Discard invalid excluded_fonts config: expected a list of font names.'
+                )
+                config_dict.pop('excluded_fonts')
+            else:
+                normalized_fonts = sorted(
+                    {
+                        font
+                        for font in excluded_fonts
+                        if isinstance(font, str) and font.strip()
+                    },
+                    key=str.casefold,
+                )
+                if len(normalized_fonts) != len(excluded_fonts):
+                    LOGGER.warning(
+                        'Discard invalid or duplicate entries in excluded_fonts config.'
+                    )
+                config_dict['excluded_fonts'] = normalized_fonts
 
         if 'module' in config_dict:
             module_cfg = config_dict['module']
@@ -410,6 +435,9 @@ def json_dump_program_config(obj, **kwargs):
             return serialize_np(obj)
         elif isinstance(obj, ModuleConfig):
             return obj.get_saving_params()
+        serializer = getattr(obj, 'to_serializable_dict', None)
+        if serializer is not None:
+            return serializer()
         return obj.__dict__
     return json.dumps(obj, default=lambda o: _default(o), ensure_ascii=False, **kwargs)
 

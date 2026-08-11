@@ -1,20 +1,42 @@
 import copy
-import sys
-from typing import List
+from typing import Iterable
 
-from qtpy.QtWidgets import QLineEdit, QSizePolicy, QHBoxLayout, QVBoxLayout, QFrame, QFontComboBox, QApplication, QPushButton, QLabel, QGroupBox, QCheckBox, QSlider
+from qtpy.QtWidgets import (
+    QApplication,
+    QFontComboBox,
+    QFrame,
+    QHBoxLayout,
+    QLineEdit,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+)
 from qtpy.QtCore import Signal, Qt
-from qtpy.QtGui import QFocusEvent, QMouseEvent, QTextCursor, QKeyEvent, QFont
+from qtpy.QtGui import QFocusEvent, QTextCursor, QKeyEvent
 
 from ballontranslator.utils import shared
 from ballontranslator.utils import config as C
-from ballontranslator.utils.fontformat import FontFormat, px2pt, LineSpacingType
-from .custom_widget import Widget, ColorPickerLabel, ClickableLabel, CheckableLabel, TextCheckerLabel, AlignmentChecker, QFontChecker, SizeComboBox, SizeControlLabel
-from .textitem import TextBlkItem
-from .text_advanced_format import TextAdvancedFormatPanel
-from .text_style_presets import TextStylePresetPanel
-from . import funcmaps as FM
-
+from ballontranslator.utils.fontformat import (
+    FontFormat,
+    LineSpacingType,
+)
+from ...custom_widget import (
+    AlignmentChecker,
+    CheckableLabel,
+    ColorPickerLabel,
+    QFontChecker,
+    SizeComboBox,
+    SizeControlLabel,
+    TextCheckerLabel,
+    Widget,
+)
+from ..item import TextBlkItem
+from .advanced import TextAdvancedFormatPanel
+from ..transforms.edit_session import TextTransformEditSession
+from ..transforms.panel import TextTransformPanel
+from .presets import TextStylePresetPanel
+from .commands import handle_ffmt_change
+from ... import shared_widget as SW
 
 class LineEdit(QLineEdit):
 
@@ -209,36 +231,42 @@ class FontSizeBox(QFrame):
 
 class FontFamilyComboBox(QFontComboBox):
     param_changed = Signal(str, object)
-    def __init__(self, emit_if_focused=True, *args, **kwargs) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.currentFontChanged.connect(self.on_fontfamily_changed)
         self.lineedit = lineedit = LineEdit(parent=self)
         lineedit.return_pressed.connect(self.on_return_pressed)
         self.setLineEdit(lineedit)
-        self.emit_if_focused = emit_if_focused
         self.return_pressed = False
         
-    def apply_fontfamily(self):
-        ffamily = self.currentFont().family()
+    def apply_fontfamily(self) -> None:
+        ffamily = self.currentText()
         if ffamily in shared.FONT_FAMILIES:
             self.param_changed.emit('font_family', ffamily)
 
-    def update_font_list(self, font_list):
-        self.currentFontChanged.disconnect(self.on_fontfamily_changed)
-        current_font = self.currentFont().family()
-        self.clear()
-        self.addItems(font_list)
+    def set_displayed_font(self, font_family: str) -> None:
+        """Show a family without changing the filtered popup model."""
+        index = self.findText(font_family)
+        self.setCurrentIndex(index)
+        if index < 0:
+            # setCurrentFont() rebuilds QFontComboBox's database-backed model.
+            self.setEditText(font_family)
 
-        # If the current font is not in the list, use the first available font
-        if current_font not in font_list:
-            if font_list:  # If the list is not empty, use the first one.
-                current_font = list(font_list)[0]
-            else:  # Don't add anything if the list is empty.
-                self.currentFontChanged.connect(self.on_fontfamily_changed)
-                return
-    
-        self.setCurrentText(current_font)
-        self.currentFontChanged.connect(self.on_fontfamily_changed)
+    def update_font_list(self, font_list: Iterable[str]) -> None:
+        font_list = list(font_list)
+        if font_list == [self.itemText(i) for i in range(self.count())]:
+            return
+
+        current_font = self.currentText()
+        self.currentFontChanged.disconnect(self.on_fontfamily_changed)
+        try:
+            self.clear()
+            self.addItems(font_list)
+            # Keep an applied hidden font visible in the editable field without
+            # putting it back in the popup or changing the underlying format.
+            self.set_displayed_font(current_font)
+        finally:
+            self.currentFontChanged.connect(self.on_fontfamily_changed)
 
     def on_return_pressed(self):
         self.return_pressed = True
@@ -264,7 +292,7 @@ class FontFormatPanel(Widget):
 
         self.vlayout = QVBoxLayout(self)
         self.vlayout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.familybox = FontFamilyComboBox(emit_if_focused=True, parent=self)
+        self.familybox = FontFamilyComboBox(parent=self)
         self.familybox.setContentsMargins(0, 0, 0, 0)
         self.familybox.setObjectName("FontFamilyBox")
         self.familybox.setToolTip(self.tr("Font Family"))
@@ -381,6 +409,15 @@ class FontFormatPanel(Widget):
             config_expand_name='expand_tadvanced_panel',
             on_format_changed=self.on_param_changed
         )
+        self.texttransform_panel = TextTransformPanel(
+            self.tr('Text Transform'),
+            config_name='text_transform_panel',
+            config_expand_name='expand_ttransform_panel',
+        )
+        self.text_transform_session = TextTransformEditSession(
+            self,
+            self.texttransform_panel,
+        )
         color_label = self.textadvancedfmt_panel.shadow_group.color_label
         color_label.changingColor.connect(self.changingColor)
         color_label.colorChanged.connect(self.onColorLabelChanged)
@@ -405,6 +442,7 @@ class FontFormatPanel(Widget):
         vl0 = QVBoxLayout()
         vl0.addWidget(self.textstyle_panel.view_widget)
         vl0.addWidget(self.textadvancedfmt_panel.view_widget)
+        vl0.addWidget(self.texttransform_panel.view_widget)
         vl0.setSpacing(0)
         vl0.setContentsMargins(0, 0, 0, 0)
         hl1 = QHBoxLayout()
@@ -464,7 +502,7 @@ class FontFormatPanel(Widget):
             return None
 
     def on_param_changed(self, param_name: str, value):
-        func = FM.handle_ffmt_change.get(param_name)
+        func = handle_ffmt_change.get(param_name)
         func_kwargs = {}
         if param_name in {'font_size', 'rel_font_size'}:
             func_kwargs['clip_size'] = True
@@ -473,6 +511,18 @@ class FontFormatPanel(Widget):
             self.update_text_style_label()
         else:
             func(param_name, value, C.active_format, is_global=False, blkitems=self.textblk_item, set_focus=True, **func_kwargs)
+
+    def resolve_text_transform_edits_for_save(self):
+        self.text_transform_session.resolve_for_save()
+
+    def resolve_text_transform_edits_for_history_change(self):
+        self.text_transform_session.resolve_for_history_change()
+
+    def resolve_text_transform_edits_for_page_change(self):
+        self.text_transform_session.resolve_for_page_change()
+
+    def cancel_text_transform_edits_for_scene_change(self):
+        self.text_transform_session.cancel_for_scene_change()
 
     def update_text_style_label(self):
         if self.global_mode():
@@ -503,7 +553,13 @@ class FontFormatPanel(Widget):
     def onAngleCtrlChanged(self, delta: int):
         self.angleBox.setValue(round(self.angleBox.value()) + delta)
 
-    def set_active_format(self, font_format: FontFormat, multi_size=False):
+    def set_active_format(
+        self,
+        font_format: FontFormat,
+        multi_size: bool = False,
+        *,
+        update_transform_panel: bool = True,
+    ) -> None:
         C.active_format = font_format
         self.familybox.blockSignals(True)
         font_size = round(font_format.font_size, 1)
@@ -514,8 +570,7 @@ class FontFormatPanel(Widget):
         if multi_size:
             font_size += "+"
         self.fontsizebox.fcombobox.setCurrentText(font_size)
-        self.familybox.setCurrentText(font_format.font_family)
-        self.familybox.setCurrentFont(QFont(font_format.font_family))
+        self.familybox.set_displayed_font(font_format.font_family)
         self.colorPicker.setPickerColor(font_format.foreground_color())
         self.strokeColorPicker.setPickerColor(font_format.stroke_color())
         self.strokeWidthBox.setValue(font_format.stroke_width)
@@ -530,6 +585,8 @@ class FontFormatPanel(Widget):
         
         self.familybox.blockSignals(False)
         self.textadvancedfmt_panel.set_active_format(font_format)
+        if update_transform_panel:
+            self.texttransform_panel.set_active_format(font_format)
 
     def set_globalfmt_title(self):
         active_text_style_label = self.active_text_style_label()
@@ -565,23 +622,50 @@ class FontFormatPanel(Widget):
             self.set_globalfmt_title()
 
     def set_textblk_item(self, textblk_item: TextBlkItem = None, multi_select:bool=False):
+        # A selection transition is a transaction boundary for transform text.
+        # Commit against the old target list before replacing it.
+        self.text_transform_session.finish_pending_edits()
+        if textblk_item is not None:
+            transform_items = [textblk_item]
+        elif multi_select:
+            transform_items = SW.canvas.selected_text_items()
+        else:
+            transform_items = []
+
+        preserve_local_owner = False
         if textblk_item is None:
             focus_w = self.app.focusWidget()
-            focus_p = None if focus_w is None else focus_w.parentWidget()
-            focus_on_fmtoptions = False
-            if self.focusOnColorDialog:
-                focus_on_fmtoptions = True
-            elif focus_p:
-                if focus_p == self or focus_p.parentWidget() == self:
-                    focus_on_fmtoptions = True
-            if not focus_on_fmtoptions:
-                # Store the current text block's format before switching to global
+            focus_on_fmtoptions = self.focusOnColorDialog or (
+                focus_w is not None
+                and (focus_w is self or self.isAncestorOf(focus_w))
+            )
+            preserve_local_owner = (
+                not transform_items
+                and self.textblk_item is not None
+                and focus_on_fmtoptions
+            )
+            if preserve_local_owner:
+                # Formatting focus can briefly clear the canvas selection; use
+                # the retained local item when comparing effective owners.
+                transform_items = [self.textblk_item]
+
+        self.text_transform_session.replace_targets(transform_items)
+
+        if textblk_item is None:
+            if not preserve_local_owner:
+                # Store the current text block's format before switching to global.
+                # This existing owner switch must preserve the complete transform.
                 if self.textblk_item is not None:
-                    # Save all format properties including gradient state
                     self.textblk_item.fontformat = copy.deepcopy(C.active_format)
                 self.textblk_item = None
-                self.set_active_format(self.global_format, multi_select)
+                self.set_active_format(
+                    self.global_format,
+                    multi_select,
+                    update_transform_panel=not transform_items,
+                )
                 self.set_globalfmt_title()
+            if transform_items:
+                self.texttransform_panel.set_transform_items(transform_items)
             
         else:
             if not self.restoring_textblk:
