@@ -330,6 +330,39 @@ class TextBlkItem(QGraphicsTextItem):
         self._emit_inline_format_changed()
         self._update_nonlinear_editing_ui()
 
+    def _move_cursor_along_vertical_flow(
+        self,
+        forward: bool,
+        keep_anchor: bool,
+    ) -> None:
+        """Move to the next logical character stop in vertical flow.
+
+        >>> callable(TextBlkItem._move_cursor_along_vertical_flow)
+        True
+        """
+        self._vertical_navigation_y = None
+        cursor = self.textCursor()
+        if cursor.hasSelection() and not keep_anchor:
+            cursor.setPosition(
+                cursor.selectionEnd()
+                if forward
+                else cursor.selectionStart()
+            )
+            self.setTextCursor(cursor)
+            return
+        operation = (
+            QTextCursor.MoveOperation.NextCharacter
+            if forward
+            else QTextCursor.MoveOperation.PreviousCharacter
+        )
+        move_mode = (
+            QTextCursor.MoveMode.KeepAnchor
+            if keep_anchor
+            else QTextCursor.MoveMode.MoveAnchor
+        )
+        if cursor.movePosition(operation, move_mode):
+            self.setTextCursor(cursor)
+
     def _emit_inline_format_changed(self) -> None:
         self.inline_format_changed.emit()
 
@@ -913,20 +946,34 @@ class TextBlkItem(QGraphicsTextItem):
 
     def keyPressEvent(self, e: QKeyEvent) -> None:
 
-        vertical_column_navigation = (
+        vertical_arrow_navigation = (
             self.isEditing()
             and isinstance(self.layout, VerticalTextDocumentLayout)
-            and e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right)
+            and e.key() in (
+                Qt.Key.Key_Left,
+                Qt.Key.Key_Right,
+                Qt.Key.Key_Up,
+                Qt.Key.Key_Down,
+            )
             and e.modifiers() in (
                 Qt.KeyboardModifier.NoModifier,
                 Qt.KeyboardModifier.ShiftModifier,
             )
         )
-        if vertical_column_navigation:
-            self._move_cursor_across_vertical_column(
-                -1 if e.key() == Qt.Key.Key_Left else 1,
-                e.modifiers() == Qt.KeyboardModifier.ShiftModifier,
+        if vertical_arrow_navigation:
+            keep_anchor = (
+                e.modifiers() == Qt.KeyboardModifier.ShiftModifier
             )
+            if e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+                self._move_cursor_across_vertical_column(
+                    -1 if e.key() == Qt.Key.Key_Left else 1,
+                    keep_anchor,
+                )
+            else:
+                self._move_cursor_along_vertical_flow(
+                    e.key() == Qt.Key.Key_Down,
+                    keep_anchor,
+                )
             e.accept()
             return
         self._vertical_navigation_y = None
@@ -1199,8 +1246,8 @@ class TextBlkItem(QGraphicsTextItem):
         self._vertical_navigation_y = None
         if not self.isEditing():
             self.startEdit(pos=event.pos())
-        else:
-            super().mouseDoubleClickEvent(event)
+            return
+        super().mouseDoubleClickEvent(event)
         self._emit_inline_format_changed()
         self._update_nonlinear_editing_ui()
         
@@ -1366,7 +1413,10 @@ class TextBlkItem(QGraphicsTextItem):
         fontformat = self.fontformat.deepcopy()
         fontformat.frgb = [color.red(), color.green(), color.blue()]
         fontformat.font_weight = font_weight_from_qt(font.weight())
-        fontformat.font_family = font_family_for_project(font.family())
+        fontformat.font_family = font_family_for_project(
+            font.family(),
+            fontformat.font_weight,
+        )
         if self.isEditing():
             fontformat.font_size = pt2px(font.pointSizeF())
         else:
@@ -1570,6 +1620,47 @@ class TextBlkItem(QGraphicsTextItem):
         self.layout.relayout_on_changed = True
         self.layout.reLayoutEverything()
         self._after_set_ffmt(cursor, repaint_background, restore_cursor, **after_kwargs)
+
+    def setFontFamilyAndWeight(
+        self,
+        family: str,
+        weight: FontWeight,
+        repaint_background: bool = True,
+        set_selected: bool = False,
+        restore_cursor: bool = False,
+    ) -> None:
+        """Apply a weight-specific family face as one document edit.
+
+        >>> callable(TextBlkItem.setFontFamilyAndWeight)
+        True
+        """
+        cursor, after_kwargs = self._before_set_ffmt(
+            set_selected, restore_cursor
+        )
+        selection_start = cursor.selectionStart()
+        selection_end = cursor.selectionEnd()
+        self.layout.relayout_on_changed = False
+        try:
+            self._doc_set_font_family(family, cursor)
+            cursor.setPosition(selection_start)
+            cursor.setPosition(
+                selection_end,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            char_format = QTextCharFormat()
+            char_format.setFontWeight(
+                QFont.Weight(font_weight_to_qt(weight, qt6=QT6))
+            )
+            self.set_cursor_cfmt(cursor, char_format, True)
+        finally:
+            self.layout.relayout_on_changed = True
+        self.layout.reLayoutEverything()
+        self._after_set_ffmt(
+            cursor,
+            repaint_background,
+            restore_cursor,
+            **after_kwargs,
+        )
 
     def _doc_set_font_family(self, value: str, cursor: QTextCursor):
         doc = self.document()
