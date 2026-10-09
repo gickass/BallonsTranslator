@@ -98,6 +98,18 @@ MAX_PAGE_LONG_SIDE = 1536
 PAGE_IMAGE_JPEG_QUALITY = 85
 
 
+def _thinking_field_enabled(profile: LLMProfile) -> bool:
+    """Whether the JSON schema should carry a leading "thinking" string.
+
+    Only relevant when a JSON schema is enforced (grammar-constrained output
+    must open with "{"), and only when thinking is not switched off.
+    """
+    if not profile.json_schema_response_format:
+        return False
+    level = str(profile.thinking_level or THINKING_AUTO).strip().lower()
+    return level not in ('none', 'off', 'disabled')
+
+
 def _uses_explicit_cache(profile: LLMProfile) -> bool:
     return profile.backend == 'openai' and (gpt_model_version(profile.model) or (0, 0)) >= (5, 6)
 
@@ -239,6 +251,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
             f'thinking_setting='
             f'{str(profile.thinking_level or THINKING_AUTO)!r}, '
             f'response_format={response_format!r}, '
+            f'thinking_field={_thinking_field_enabled(profile)}, '
             f'prompt_cache={cache_mode!r}'
         )
 
@@ -387,6 +400,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         profile = self.profile
         model = self._text_model(profile)
         array_response = profile.backend == 'codex' or gpt_model_version(model) is not None
+        thinking_enabled = _thinking_field_enabled(profile)
         target_language_name = self._translated_lang(target_language)
         prompt_spec = TranslationPromptSpec(
             source_language=self._translated_lang(source_language),
@@ -397,10 +411,12 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                 history_enabled=history_enabled,
                 summary_enabled=request_summary,
                 array_response=array_response,
+                thinking_enabled=thinking_enabled,
             ),
             summary_enabled=request_summary,
             history_enabled=history_enabled,
             array_response=array_response,
+            thinking_enabled=thinking_enabled,
         )
         vision_request = None
         if (
@@ -1129,6 +1145,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         expected_translations: int = 1,
         *,
         summary_enabled: bool = False,
+        thinking_enabled: bool = False,
     ) -> Dict:
         model = self._text_model(profile)
         gpt_version = gpt_model_version(model)
@@ -1153,6 +1170,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                     expected_translations,
                     summary_enabled=summary_enabled,
                     array_response=profile.backend == 'codex' or gpt_version is not None,
+                    thinking_enabled=thinking_enabled,
                 )
                 if profile.json_schema_response_format
                 else {}
@@ -1168,6 +1186,26 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                 api_args[api_key] = penalty
 
         return api_args
+
+    def _log_thinking(
+        self,
+        thinking: str,
+        page_key: Optional[str],
+        attempt: int,
+    ) -> None:
+        """Log the schema's "thinking" field so its arrival can be verified."""
+        safe_page_key = str(page_key or '-').replace('\r', ' ').replace('\n', ' ')
+        prefix = f'LLM thinking field: page={safe_page_key}, attempt={attempt}'
+        if not thinking:
+            self.logger.warning(
+                f'{prefix}, received=False (missing or empty; the server may '
+                'be ignoring the json_schema or the model left it blank)'
+            )
+            return
+        self.logger.debug(
+            f'{prefix}, received=True, chars={len(thinking)}, '
+            f'content={thinking!r}'
+        )
 
     def _log_token_usage(
         self,
@@ -1208,6 +1246,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
         usage_attempt: Optional[int] = None,
         summary_enabled: bool = False,
         codex_turn: Optional['CodexTurnState'] = None,
+        thinking_enabled: bool = False,
     ) -> str:
         request_kwargs = {'codex_turn': codex_turn} if codex_turn is not None else {}
         try:
@@ -1218,6 +1257,7 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                     messages,
                     expected_translations,
                     summary_enabled=summary_enabled,
+                    thinking_enabled=thinking_enabled,
                 ),
                 **request_kwargs,
             )
@@ -1319,6 +1359,8 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                 if codex_turn is not None:
                     request_kwargs['codex_turn'] = codex_turn
                 self._translation_codex_response = None
+                if prompt_spec.thinking_enabled:
+                    request_kwargs['thinking_enabled'] = True
                 raw_response = self._request_translation(
                     profile,
                     messages,
@@ -1343,6 +1385,10 @@ class LLMTranslator(LLMChatRequester, BaseTranslator):
                     )
                     raise
                 translations = list(parsed.translations)
+                if prompt_spec.thinking_enabled:
+                    self._log_thinking(
+                        parsed.thinking, usage_page_key, provider_attempt,
+                    )
                 successful_context = active_context
                 break
             except ContextLengthError as error:
